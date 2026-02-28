@@ -1,0 +1,1159 @@
+# import modules
+from classy import Class
+import numpy as np
+import scipy.integrate as integrate
+import math
+import scipy.optimize as opt
+from numpy.linalg import inv
+import time
+
+
+# ======================================================================
+# Create the list of correlated redshift-bin pairs (upper triangular)
+# ======================================================================
+def n_bins_correlated(z, nD):
+    """
+    Build array of bin pairs (i,j) with j >= i and within correlation range nD.
+    """
+    lis = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                lis.append([i, j])
+    return np.array(lis, int)
+
+
+# ======================================================================
+# Raccanelli dN/dz/dOmega (galaxy distribution)
+# ======================================================================
+def dNdzdomega_ABH_Raccanelli(z):
+    """
+    Galaxy redshift distribution dN/dz dOmega from Raccanelli et al.
+    Used for computing the shot noise.
+    """
+    A = 0.000000135 * 4. * np.pi
+    alfa = 6.12
+    z0 = 0.00202
+    beta = 0.41
+    return A * ((z / z0)**alfa) * np.exp(-(z / z0)**beta)
+
+
+# ======================================================================
+# Unnormalized Gaussian for redshift bin window
+# ======================================================================
+def gauss(x, x0, s):
+    """
+    Unnormalized Gaussian with mean x0 and width s.
+    """
+    return np.exp(-0.5 * ((x - x0) / s)**2)
+
+
+# ======================================================================
+# Shot noise for each redshift bin
+# ======================================================================
+def shot_noise_s(zed, sigma, zmin, zmax, dNdzdOm_s):
+    """
+    Computes shot noise N_i = 1 / ∫ dN/dz * W_i(z) dz for each redshift bin.
+    """
+    noise = []
+    for i in range(len(sigma)):
+        integrand = lambda x: dNdzdOm_s(x) * gauss(x, zed[i], sigma[i])
+        temp = integrate.quad(integrand, zmin[i], zmax[i])
+        noise.append(1. / temp[0])
+    return np.array(noise, float)
+
+
+# ======================================================================
+# Recognize C_l indices – maps (zi × zj) to dictionary keys
+# ======================================================================
+def recognize(z, dic, nD):
+    """
+    Creates dictionaries to map each (zi,zj) redshift-bin pair to its C_l array.
+    Used for non-derivative C_l (fiducial cosmology).
+    """
+    lis = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                lis.append([i, j])
+
+    clsd = dic['dd']  # access C_l^{delta delta}
+    translate = {}
+    call = {}
+
+    for k, v in clsd.items():
+        translate[str(lis[k]).strip('[]'), k] = v
+        call[str(lis[k]).strip('[]')] = v
+
+    return translate, call
+
+
+# ======================================================================
+# Same as recognize() but for derivatives
+# ======================================================================
+def recognize_derivative(z, array, nD):
+    """
+    Maps (zi,zj) indices to arrays of dC_l/dp derivatives.
+    """
+    lis = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                lis.append([i, j])
+    lis = np.array(lis, int)
+
+    translate = {}
+    call = {}
+
+    for i in range(len(array)):
+        translate[str(lis[i]).strip('[]'), i] = array[i]
+        call[str(lis[i]).strip('[]')] = array[i]
+
+    return translate, call
+
+
+# ======================================================================
+# Build gamma_l (covariance element) and its inverse for a given multipole l
+# ======================================================================
+def create_gamma(l, gamm_dic, z, nD):
+    """
+    Builds the full gamma_l matrix for multipole l:
+    Gamma_l = C_l + N (on diagonal) and symmetric off-diagonal.
+    Returns both Gamma_l and its inverse.
+    """
+    # Build list of bin pairs
+    diag_s = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                diag_s.append([i, j])
+    diag_s = np.array(diag_s, int)
+
+    # Extract the correct C_l entry for each (i,j)
+    ten = []
+    for pair in diag_s:
+        key = str(list(pair)).strip('[]')
+        ten.append(gamm_dic[key][l])
+
+    # Fill upper-triangular matrix
+    gamma_li = np.zeros([len(z), len(z)], float)
+    h = 0
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                gamma_li[i, j] = ten[h]
+                h += 1
+
+    # Symmetrize: diagonal + transpose of upper part
+    DD = np.diag(np.diag(gamma_li))
+    upper = gamma_li - DD
+    upper = upper.T
+    final = gamma_li + upper
+
+    inversa = inv(final)
+    return final, inversa
+
+
+# ======================================================================
+# Same as create_gamma() but returns only the matrix (not inverse)
+# ======================================================================
+def create_matrix(l, gamm_dic, z, nD):
+    """
+    Builds the symmetric matrix C_l(zi,zj) for multipole l.
+    """
+    diag_s = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                diag_s.append([i, j])
+    diag_s = np.array(diag_s, int)
+
+    ten = []
+    for pair in diag_s:
+        key = str(list(pair)).strip('[]')
+        ten.append(gamm_dic[key][l])
+
+    gamma_li = np.zeros([len(z), len(z)], float)
+    h = 0
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                gamma_li[i, j] = ten[h]
+                h += 1
+
+    DD = np.diag(np.diag(gamma_li))
+    upper = gamma_li - DD
+    upper = upper.T
+    final = gamma_li + upper
+    return final
+
+
+# ======================================================================
+# Derivative of C_l wrt cosmological parameter via finite difference
+# ======================================================================
+def derivate(z, dx, Cl, nD, l_var):
+    """
+    Computes numerical derivatives dC_l/dp using (C⁺ - C⁻) / (p⁺ - p⁻).
+    """
+    lis = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                lis.append([i, j])
+    lis = np.array(lis, int)
+
+    h = (dx[1] - dx[2])
+    dcl = np.zeros([len(lis), l_var+1], float)
+
+    for i in range(len(lis)):
+        dcl[i, :] = Cl[1][i] - Cl[2][i]
+
+    return dcl / h
+
+
+# ======================================================================
+# Build gamma including shot noise
+# ======================================================================
+def gamma(z, Cl_ordered, noise, nD, l_var):
+    """
+    Builds gamma(z_i, z_j, l) including shot noise on the diagonal:
+      gamma_ii = C_l(zi,zi) + noise_i
+      gamma_ij = C_l(zi,zj)
+    Returns:
+        Cl (diagonal only)
+        noise
+        res (diagonal + noise)
+        bis (full gamma dictionary)
+    """
+    # Identify diagonal bins (auto-correlations)
+    diag = np.array([[i, i] for i in range(len(z))])
+
+    # Extract Cl for diagonals
+    Cl = np.zeros([len(diag), l_var+1], float)
+    for i in range(len(diag)):
+        key = str(list(diag[i])).strip('[]')
+        Cl[i, :] = Cl_ordered[key]
+
+    # Add shot noise
+    res = np.zeros_like(Cl)
+    for i in range(len(Cl)):
+        res[i, :] = Cl[i, :] + noise[i]
+
+    # Off-diagonal entries
+    lis = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j > i) & (j < i + (nD + 1)):
+                lis.append([i, j])
+    lis = np.array(lis, int)
+
+    bis = {}
+    # Fill diagonal with Cl+N
+    for i in range(len(diag)):
+        key = str(list(diag[i])).strip('[]')
+        bis[key] = res[i, :]
+
+    # Fill off-diagonal with Cl
+    for i in range(len(lis)):
+        key = str(list(lis[i])).strip('[]')
+        bis[key] = Cl_ordered[key]
+
+    return Cl, noise, res, bis
+
+
+# ======================================================================
+# Fast Fisher element (matrix trace formula)
+# ======================================================================
+def Fisher_riferimento(par1, par2, gamma, l_var):
+    """
+    Computes Fisher element using Tr[ dC dC Gamma^{-1} Gamma^{-1} ] for each l.
+    """
+    parametro = 0.
+    trace = []
+
+    for l in range(2, l_var+1):
+        r = np.dot(par1[l], gamma[l])
+        r1 = np.dot(r, par2[l])
+        ris = np.dot(r1, gamma[l])
+        trace.append(np.trace(ris))
+
+    trace = np.array(trace)
+    for l in range(2, l_var+1):
+        parametro += (2*l + 1) * 0.5 * trace[l-2]
+
+    return parametro
+
+
+# ======================================================================
+# Full Fisher with explicit covariance construction
+# ======================================================================
+def Fisher_overlap_mio(z, par1, par2, gamma, l_var):
+    """
+    Fisher matrix using explicit covariance matrix of all bin pairs.
+    Very slow (O(n^4)).
+    """
+    parametro = 0.
+    trace = []
+    n = len(z)
+
+    for ell in range(2, l_var+1):
+        for i in range(n):
+            for j in range(n):
+                for p in range(n):
+                    for q in range(n):
+                        if (i <= j) and (p <= q):
+                            cov = (gamma[ell, i, p]*gamma[ell, j, q] +
+                                   gamma[ell, i, q]*gamma[ell, j, p]) / (2.*ell+1)
+                            inv_cov = inv(cov)
+                        ris = par1[ell, i, j] * par1[ell, p, q] * inv_cov
+                        trace.append(np.trace(ris))
+
+    return sum(trace)
+
+
+# ======================================================================
+# Derivatives w.r.t. bias parameters A and B
+# ======================================================================
+def derivate_bias_params(der_bias, z):
+    """
+    Given dC_l/db for each bin, compute:
+        dC_l/dA  and  dC_l/dB
+    using the chain rule for b(z) = A*(1+z)^B.
+    """
+    A = 1.2
+    B = 0.59
+
+    d_b_dA = (1 + z)**B
+    d_b_dB = A * (1 + z)**B * np.log(1 + z)
+
+    dCl_dA = np.sum(der_bias * d_b_dA[:, None, None, None], axis=0)
+    dCl_dB = np.sum(der_bias * d_b_dB[:, None, None, None], axis=0)
+
+    return dCl_dA, dCl_dB
+
+
+# ======================================================================
+# Fisher matrix for arbitrary parameters (clean formulation)
+# ======================================================================
+def Fisher(z, par1, par2, gamma, l_var):
+    """
+    Computes Fisher element:
+      F = sum_l dC^T Cov^{-1} dC
+    Only uses i ≤ j pairs (unique correlations).
+    """
+    n_bins = len(z)
+    pairs = [(i, j) for i in range(n_bins) for j in range(i, n_bins)]
+    n_pairs = len(pairs)
+
+    F_element = 0.0
+
+    for ell in range(2, l_var+1):
+        # Build covariance matrix
+        Cov = np.zeros((n_pairs, n_pairs))
+        for m, (i, j) in enumerate(pairs):
+            for n, (p, q) in enumerate(pairs):
+                Cov[m, n] = (gamma[ell, i, p]*gamma[ell, j, q] +
+                             gamma[ell, i, q]*gamma[ell, j, p]) / (2*ell+1)
+
+        # Invert covariance
+        try:
+            Cov_inv = np.linalg.inv(Cov)
+        except np.linalg.LinAlgError:
+            print(ell)
+            continue
+
+        # Build derivative vectors
+        d1 = np.array([par1[ell, i, j] for (i, j) in pairs])
+        d2 = np.array([par2[ell, i, j] for (i, j) in pairs])
+
+        F_element += np.dot(d1, Cov_inv @ d2)
+
+    return F_element
+
+
+# ======================================================================
+# Derivative wrt bias by finite difference
+# ======================================================================
+def derivate_b(z, b_p, b_m, Cl_p, Cl_m, nD, l_var):
+    """
+    Numerical derivative dC_l/db = (C_l(b+)-C_l(b-)) / (b+ - b-).
+    """
+    lis = []
+    for i in range(len(z)):
+        for j in range(len(z)):
+            if (j >= i) & (j < i + (nD + 1)):
+                lis.append([i, j])
+    lis = np.array(lis, int)
+
+    h = b_p - b_m
+    dcl = np.zeros([len(lis), l_var+1], float)
+    for i in range(len(lis)):
+        dcl[i, :] = Cl_p[i] - Cl_m[i]
+    return dcl / h
+
+
+# ======================================================================
+# Compute (z_i, sigma_i) from bin boundaries
+# ======================================================================
+def z_june(zmin, zmax):
+    """
+    Returns bin centers z_i and widths sigma_i = (zmax - zmin)/2.
+    """
+    z = []
+    sigma = []
+    for i in range(len(zmin)):
+        z_i = 0.5 * (zmin[i] + zmax[i])
+        s_i = 0.5 * (zmax[i] - zmin[i])
+        z.append(z_i)
+        sigma.append(s_i)
+    return np.array(z, float), np.array(sigma, float)
+
+
+################ FIDUCIAL REDSHIFT BINS ################
+# Lower edges of the redshift bins
+zmin = np.array([0.0, 0.74, 1.18, 1.54, 1.90, 2.26, 2.62, 3., 3.46, 4.46], float)
+
+# Upper edges of the redshift bins
+zmax = np.array([0.74, 1.18, 1.54, 1.90, 2.26, 2.62, 3., 3.46, 4.46, 6.], float)
+########################################################
+
+# Compute bin centers z_i and bin widths sigma_i
+z, sigma = z_june(zmin, zmax)
+
+# Compute shot noise for each redshift bin
+# Shot noise is given by N_i = 1 / ∫ dN/dz * W_i(z) dz
+noise = shot_noise_s(z, sigma, zmin, zmax, dNdzdomega_ABH_Raccanelli)
+
+# 'noise' is an array containing the shot noise term
+# for each redshift auto-correlation: N(z0,z0), ..., N(zi,zi)
+# ---------------------------------------------------------------------
+# Fiducial GW bias definition per redshift bin
+# ---------------------------------------------------------------------
+
+bias_bins = []
+m_bias = []
+
+# Fiducial bias parameters: b(z) = A * (1 + z)^B
+A = 1.2
+B = 0.59
+
+for i in range(len(z)):
+    # Compute fiducial galaxy bias at each redshift
+    temp = A * (z[i] + 1.)**B
+    bias_bins.append(temp)
+
+    # Magnification bias (assumed constant here)
+    m_bias.append(0.4)
+
+# Bin widths (used for Gaussian window functions)
+width = np.copy(sigma)
+
+bias_bins = np.array(bias_bins, float)
+m_bias = np.array(m_bias, float)
+
+# Bias matrix:
+# columns = [fiducial, plus variation, minus variation]
+bias = np.zeros(([len(z), 3]), float)
+
+# ---------------------------------------------------------------------
+# Cosmological parameters: fiducial, plus, minus
+# Variations are at the level of 10^{-3} of the fiducial value
+# ---------------------------------------------------------------------
+
+# Omega_b h^2
+omb = np.array([0.02242, 0.02244242, 0.02239758], float)
+
+# Scalar amplitude A_s
+A = np.array([2.105e-9, 2.107105e-09, 2.102895e-09], float)
+
+# Scalar spectral index n_s
+ns = np.array([0.9665, 0.9674665, 0.9655335], float)
+
+# Optical depth tau
+tau = np.array([0.0561, 0.0561561, 0.0560439], float)
+
+# Omega_cdm h^2
+omc = np.array([0.11933, 0.11944933, 0.11921067], float)
+
+# H0
+H0 = np.array([67.66, 67.72766, 67.59234], float)
+
+#  f_NL
+fnl = np.array([
+    0.01,
+    0.01 * (1 + 0.001),
+    0.01 * (1 - 0.001)
+], float)
+
+# ---------------------------------------------------------------------
+# Build bias matrix with fiducial, plus and minus 
+# ---------------------------------------------------------------------
+for i in range(len(z)):
+    bias[i, 0] = bias_bins[i]                       # fiducial
+    bias[i, 1] = bias_bins[i] * (1 + 1e-3)          # plus
+    bias[i, 2] = bias_bins[i] * (1 - 1e-3)          # minus
+
+# Maximum bin separation allowed in correlations
+nD = len(z) - 1
+
+# Maximum multipole
+lmax = 100
+
+# ---------------------------------------------------------------------
+#  Multi_CLASS settings 
+# ---------------------------------------------------------------------
+common_settings = {
+    'selection_mean': str(list(z)).strip('[]'),
+    'selection_multitracing': 'no',
+    'selection_dNdz_1': 'analytic',
+    'selection_tracer_1': 'astrophysical_gws',
+    'number count contributions': 'density,rsd',
+    'l_switch_limber_for_nc_local_over_z': 10000,
+    'l_switch_limber_for_nc_los_over_z': 2000,
+    'modes': 's',
+    'selection_window': 'gaussian',
+    'l_max_lss': 102,
+    'selection_width': str(list(width)).strip('[]'),
+    'selection_magnification_bias': str(list(m_bias)).strip('[]'),
+    'non_diagonal': nD,
+    'write warnings': 'yes'
+}
+
+# ---------------------------------------------------------------------
+# Build bias "plus" and "minus" matrices
+# Each column corresponds to varying one redshift bin bias at a time
+# ---------------------------------------------------------------------
+
+plus = np.zeros([len(z), len(z)], float)
+minus = np.zeros([len(z), len(z)], float)
+
+# ------------------ PLUS bias configurations ------------------
+plus[0, 0] = bias[0, 1]
+for i in range(1, len(z)):
+    plus[0:i, i] = bias[0:i, 0]
+    plus[i, i] = bias[i, 1]
+    plus[i:len(z), i-1] = bias[i:len(z), 0]
+
+# ------------------ MINUS bias configurations -----------------
+minus[0, 0] = bias[0, 2]
+for i in range(1, len(z)):
+    minus[0:i, i] = bias[0:i, 0]
+    minus[i, i] = bias[i, 2]
+    minus[i:len(z), i-1] = bias[i:len(z), 0]
+
+# ---------------------------------------------------------------------
+# Dictionaries to store Multi_CLASS outputs
+# ---------------------------------------------------------------------
+
+M = {}
+N = {}
+
+ll = {}
+
+cls_omc, cldd_omc = {}, {}
+cls_ns, cldd_ns = {}, {}
+cls_tau, cldd_tau = {}, {}
+cls_H0, cldd_H0 = {}, {}
+cls_fnl, cldd_fnl = {}, {}
+cls_A, cldd_A = {}, {}
+cls_omb, cldd_omb = {}, {}
+
+cls_bias_p, cldd_bias_p = {}, {}
+cls_bias_m, cldd_bias_m = {}, {}
+
+# Initialize CLASS instances for cosmological parameters
+for i in range(len(omc)):
+    M[i] = Class()
+
+# ---------------------------------------------------------------------
+# Omega_cdm variations
+# ---------------------------------------------------------------------
+for i in range(3):
+    M[i].set(common_settings)
+    M[i].set({'selection_bias': str(list(bias[:, 0])).strip('[]')})
+    M[i].set({'omega_cdm': omc[i]})
+    M[i].set({'H0': H0[0]})
+    M[i].set({'f_NL': fnl[0]})
+    M[i].set({'n_s': ns[0]})
+    M[i].set({'tau_reio': tau[0]})
+    M[i].set({'omega_b': omb[0]})
+    M[i].set({'A_s': A[0]})
+    M[i].set({'output': 'nCl'})
+    M[i].compute()
+
+    cls_omc[i] = M[i].density_cl(lmax)
+    cldd_omc[i] = cls_omc[i]['dd']
+
+for i in range(3):
+    M[i].empty()
+
+# ---------------------------------------------------------------------
+# n_s variations
+# ---------------------------------------------------------------------
+for i in range(1, 3):
+    M[i].set(common_settings)
+    M[i].set({'selection_bias': str(list(bias[:, 0])).strip('[]')})
+    M[i].set({'omega_cdm': omc[0]})
+    M[i].set({'H0': H0[0]})
+    M[i].set({'f_NL': fnl[0]})
+    M[i].set({'n_s': ns[i]})
+    M[i].set({'tau_reio': tau[0]})
+    M[i].set({'omega_b': omb[0]})
+    M[i].set({'A_s': A[0]})
+    M[i].set({'output': 'nCl'})
+    M[i].compute()
+
+    cls_ns[i] = M[i].density_cl(lmax)
+    cldd_ns[i] = cls_ns[i]['dd']
+
+for i in range(1, 3):
+    M[i].empty()
+
+# ---------------------------------------------------------------------
+# tau variations
+# ---------------------------------------------------------------------
+for i in range(1, 3):
+    M[i].set(common_settings)
+    M[i].set({'selection_bias': str(list(bias[:, 0])).strip('[]')})
+    M[i].set({'omega_cdm': omc[0]})
+    M[i].set({'H0': H0[0]})
+    M[i].set({'f_NL': fnl[0]})
+    M[i].set({'n_s': ns[0]})
+    M[i].set({'tau_reio': tau[i]})
+    M[i].set({'omega_b': omb[0]})
+    M[i].set({'A_s': A[0]})
+    M[i].set({'output': 'nCl'})
+    M[i].compute()
+
+    cls_tau[i] = M[i].density_cl(lmax)
+    cldd_tau[i] = cls_tau[i]['dd']
+
+for i in range(1, 3):
+    M[i].empty()
+
+# ---------------------------------------------------------------------
+# H0 variations
+# ---------------------------------------------------------------------
+for i in range(1, 3):
+    M[i].set(common_settings)
+    M[i].set({'selection_bias': str(list(bias[:, 0])).strip('[]')})
+    M[i].set({'omega_cdm': omc[0]})
+    M[i].set({'n_s': ns[0]})
+    M[i].set({'tau_reio': tau[0]})
+    M[i].set({'H0': H0[i]})
+    M[i].set({'f_NL': fnl[0]})
+    M[i].set({'omega_b': omb[0]})
+    M[i].set({'A_s': A[0]})
+    M[i].set({'output': 'nCl'})
+    M[i].compute()
+
+    cls_H0[i] = M[i].density_cl(lmax)
+    cldd_H0[i] = cls_H0[i]['dd']
+    ll[i] = cls_H0[i]['ell'][2:]
+
+for i in range(1, 3):
+    M[i].empty()
+
+# ---------------------------------------------------------------------
+# f_NL variations
+# ---------------------------------------------------------------------
+for i in range(1, 3):
+    M[i].set(common_settings)
+    M[i].set({'selection_bias': str(list(bias[:, 0])).strip('[]')})
+    M[i].set({'omega_cdm': omc[0]})
+    M[i].set({'n_s': ns[0]})
+    M[i].set({'tau_reio': tau[0]})
+    M[i].set({'H0': H0[0]})
+    M[i].set({'f_NL': fnl[i]})
+    M[i].set({'omega_b': omb[0]})
+    M[i].set({'A_s': A[0]})
+    M[i].set({'output': 'nCl'})
+    M[i].compute()
+
+    cls_fnl[i] = M[i].density_cl(lmax)
+    cldd_fnl[i] = cls_fnl[i]['dd']
+
+for i in range(1, 3):
+    M[i].empty()
+
+# ---------------------------------------------------------------------
+# Bias variations (plus)
+# ---------------------------------------------------------------------
+for i in range(len(z)):
+    N[i] = Class()
+    N[i].set(common_settings)
+    N[i].set({'selection_bias': str(list(plus[:, i])).strip('[]')})
+    N[i].set({'omega_cdm': omc[0]})
+    N[i].set({'n_s': ns[0]})
+    N[i].set({'tau_reio': tau[0]})
+    N[i].set({'H0': H0[0]})
+    N[i].set({'f_NL': fnl[0]})
+    N[i].set({'omega_b': omb[0]})
+    N[i].set({'A_s': A[0]})
+    N[i].set({'output': 'nCl'})
+    N[i].compute()
+
+    cls_bias_p[i] = N[i].density_cl(lmax)
+    cldd_bias_p[i] = cls_bias_p[i]['dd']
+
+    N[i].empty()
+
+# ---------------------------------------------------------------------
+# Bias variations (minus)
+# ---------------------------------------------------------------------
+for i in range(len(z)):
+    N[i] = Class()
+    N[i].set(common_settings)
+    N[i].set({'selection_bias': str(list(minus[:, i])).strip('[]')})
+    N[i].set({'omega_cdm': omc[0]})
+    N[i].set({'n_s': ns[0]})
+    N[i].set({'tau_reio': tau[0]})
+    N[i].set({'H0': H0[0]})
+    N[i].set({'f_NL': fnl[0]})
+    N[i].set({'omega_b': omb[0]})
+    N[i].set({'A_s': A[0]})
+    N[i].set({'output': 'nCl'})
+    N[i].compute()
+
+    cls_bias_m[i] = N[i].density_cl(lmax)
+    cldd_bias_m[i] = cls_bias_m[i]['dd']
+
+    N[i].empty()
+# Maximum multipole used in the Fisher analysis
+# This l-cut can be varied to test the impact of small-scale modes
+# (e.g. cut = 80, 60, 30)
+cut = 100
+
+
+# ---------------------------------------------------------------------
+# Numerical derivatives of the angular power spectra
+# ---------------------------------------------------------------------
+# Each Dcl_x contains the numerical derivative dC_ell/dx computed
+# via finite differences.
+#
+# The output array has shape:
+#   Dcl_x[N_pairs, l_max + 1]
+# where:
+#   N_pairs = n(n+1)/2  is the number of unique (zi, zj) bin pairs,
+#   n = len(z)
+#
+# Ordering convention:
+#   Dcl_x[0, :] -> (z0 × z0)
+#   Dcl_x[1, :] -> (z0 × z1)
+#   Dcl_x[2, :] -> (z0 × z2)
+#   ...
+# Only pairs with j >= i are stored to avoid redundancy.
+# ---------------------------------------------------------------------
+
+# Derivative with respect to cold dark matter density
+Dcl_omc = derivate(z, omc, cldd_omc, nD, lmax)    # dC_ell / d(omega_cdm)
+
+# Derivative with respect to scalar spectral index
+Dcl_ns = derivate(z, ns, cldd_ns, nD, lmax)       # dC_ell / d(n_s)
+
+# Derivative with respect to optical depth
+Dcl_tau = derivate(z, tau, cldd_tau, nD, lmax)    # dC_ell / d(tau_reio)
+
+# Derivative with respect to the Hubble parameter
+Dcl_H0 = derivate(z, H0, cldd_H0, nD, lmax)       # dC_ell / d(H0)
+
+# Derivative with respect to baryon density
+Dcl_omb = derivate(z, omb, cldd_omb, nD, lmax)    # dC_ell / d(omega_b)
+
+# Derivative with respect to primordial scalar amplitude
+Dcl_A = derivate(z, A, cldd_A, nD, lmax)          # dC_ell / d(A_s)
+
+# Derivative with respect to local-type primordial non-Gaussianity
+Dcl_fnl = derivate(z, fnl, cldd_fnl, nD, lmax)    # dC_ell / d(f_NL)
+# ---------------------------------------------------------------------
+# Apply multipole cut to the derivative arrays
+# ---------------------------------------------------------------------
+# Only multipoles up to ell = cut are retained.
+# This allows us to study the impact of removing small-scale information
+# on the Fisher constraints.
+
+Dcl_omc = Dcl_omc[:, :cut+1]   # dC_ell / d(omega_cdm)
+Dcl_omb = Dcl_omb[:, :cut+1]   # dC_ell / d(omega_b)
+Dcl_H0  = Dcl_H0[:, :cut+1]    # dC_ell / d(H0)
+Dcl_ns  = Dcl_ns[:, :cut+1]    # dC_ell / d(n_s)
+Dcl_tau = Dcl_tau[:, :cut+1]   # dC_ell / d(tau_reio)
+Dcl_A   = Dcl_A[:, :cut+1]     # dC_ell / d(A_s)
+Dcl_fnl = Dcl_fnl[:, :cut+1]   # dC_ell / d(f_NL)
+# Debug checks for the structure of the C_ell and derivative arrays
+
+# Length of C_ell^{z0 × z0} for all multipoles (example check)
+# This prints the number of multipoles contained in cldd_ns for the +Δ case
+# (index 1 corresponds to the "plus" model in my nested dictionary)
+# print(len(cldd_ns[1][0]))
+
+# Notes about the internal structure:
+# - cldd_ns is a nested dictionary with two keys: 
+#       1 → fiducial + delta
+#       2 → fiducial - delta
+# - cldd_ns[1] is a dictionary whose keys correspond to redshift-bin pairs.
+#   For example, with N_z = 10, one gets 55 unique pairs (N_z*(N_z+1)/2).
+# - cldd_ns[1][0] contains the C_ell spectrum for the first bin pair (z0 × z0).
+#   Its length corresponds to the number of multipoles l.
+
+# Example debug prints (comment them out when not needed):
+
+# print(len(Dcl_ns))      # number of redshift-bin pairs: N_z(N_z+1)/2
+# print(len(Dcl_ns[0]))   # number of multipoles (after applying the 'cut')
+
+# Example: print first few multipoles of the omc derivative matrix to check values
+# print(Dcl_omc[:, :3])   # print first 3 multipoles for all bin pairs
+# Dictionary to store the derivatives of C_ell with respect to the bias
+Dcl_bias = {}
+
+# Loop over each redshift bin and compute the derivative wrt the bias in that bin
+for i in range(len(z)):
+
+    # For each bin i, we call derivate_b using:
+    #  - z               : array of redshift bin centers
+    #  - bias[i,1]       : bias_plus  for bin i
+    #  - bias[i,2]       : bias_minus for bin i
+    #  - cldd_bias_p[i]  : C_ell computed with bias_plus in bin i
+    #  - cldd_bias_m[i]  : C_ell computed with bias_minus in bin i
+    #  - nD              : number of unique bin-pairs (n_z(n_z+1)/2)
+    #  - lmax            : maximum multipole index
+    #
+    # The function returns the numerical derivative:
+    #       dC_ell / d(b_i)
+    # for all pairs of redshift bins and all multipoles.
+    
+    Dcl_bias[i] = derivate_b(
+        z,
+        bias[i,1],
+        bias[i,2],
+        cldd_bias_p[i],
+        cldd_bias_m[i],
+        nD,
+        lmax
+    )
+# Truncate all derivative arrays dC_ell/db_i to the multipole range [0, cut]
+# We build a new dictionary with the same keys as Dcl_bias.
+
+new_Dcl_bias = {
+    key: [
+        # Each element 'arr' is a derivative spectrum for a given bin-pair.
+        # We check if it has the expected length (lmax+1 multipoles).
+        # If yes → we cut it to (cut+1) multipoles.
+        # If not → we keep it unchanged.
+        arr[:cut+1] if len(arr) == lmax + 1 else arr
+        for arr in value
+    ]
+    for key, value in Dcl_bias.items()
+}
+# Dcl_bias[i] is a dictionary where index "i" indicates the derivative
+# with respect to the bias parameter b_i:
+#       dC_ell(z_m × z_n) / d b_i
+
+############## Recognize derivatives for cosmological parameters ###############
+
+# For each Dcl array, recognize_derivative:
+#   - check_Dcl_*    → dictionary that maps each entry to the (m,n) bin-pair
+#   - ordered_Dcl_*  → list of arrays ordered according to redshift pairs
+# This identifies which C_ell(z_i × z_j) corresponds to each derivative.
+
+check_Dcl_omc, ordered_Dcl_omc = recognize_derivative(z, Dcl_omc, nD)
+check_Dcl_ns,  ordered_Dcl_ns  = recognize_derivative(z, Dcl_ns,  nD)
+check_Dcl_tau, ordered_Dcl_tau = recognize_derivative(z, Dcl_tau, nD)
+check_Dcl_H0,  ordered_Dcl_H0  = recognize_derivative(z, Dcl_H0,  nD)
+check_Dcl_fnl, ordered_Dcl_fnl = recognize_derivative(z, Dcl_fnl, nD)
+check_Dcl_omb, ordered_Dcl_omb = recognize_derivative(z, Dcl_omb, nD)
+check_Dcl_A,   ordered_Dcl_A   = recognize_derivative(z, Dcl_A,   nD)
+
+# The *check* dictionary tells you which (z_i, z_j) pair each derivative corresponds to.
+# The *ordered* version provides the derivatives already sorted in the correct bin-pair order.
+
+
+############## Recognize derivatives for the bias parameters ###############
+
+check_Dcl_bias   = {}
+ordered_Dcl_bias = {}
+
+# For each bias parameter b_i, compute the mapping for the derivative dC_ell/db_i
+for i in range(len(z)):
+    check_Dcl_bias[i], ordered_Dcl_bias[i] = recognize_derivative(
+        z,
+        new_Dcl_bias[i],   # truncated derivative array
+        nD                 # total number of unique bin pairs
+    )
+############## Recognize Fiducial Cl ###############
+
+# Here I identify the structure of the fiducial C_ell matrix:
+#   - check_Cl    → dictionary that maps each entry to the (z_i, z_j) bin-pair
+#   - ordered_Cl  → list of C_ell arrays ordered according to bin-pair indices
+#
+# cls_omc[0] contains the fiducial C_ell (dd) spectrum for all (i,j) bin pairs.
+# The function recognize(...) reorganizes and labels these spectra so that I
+# know exactly which C_ell(z_i × z_j) each array corresponds to.
+
+check_Cl, ordered_Cl = recognize(z, cls_omc[0], nD)
+################ RULE TO CALL ORDERED_STUFF #############
+# How derivatives should be accessed:
+#   check_Dcl_H0['0, 0', 0]   → identifies which (i,j) pair corresponds to a given entry
+#   ordered_Dcl_H0['0, 0']    → retrieves the derivative dC_ell/dH0 for that bin-pair
+#
+# These rules apply to all ordered_Dcl_* and check_Dcl_* dictionaries.
+
+############## Build gamma function components ###############
+
+# The gamma(...) function returns:
+#   - Cl      : array of fiducial auto-correlation C_ell(z_i × z_i) for all bins
+#   - noisii  : noise contribution for each auto-spectrum
+#   - res     : diagonal term N + C_ell_ii
+#   - gamm    : dictionary containing the full gamma matrix:
+#               gamma_ij(l) = N_ij + C_ell(z_i × z_j)
+#
+# ordered_Cl contains the fiducial C_ell spectra arranged in bin-pair order.
+
+Cl, noisii, res, gamm = gamma(z, ordered_Cl, noise, nD, lmax)
+
+# Debug notes:
+# - len(Cl) gives the number of redshift bins
+# - len(ordered_Cl.keys()) gives the number of unique (i,j) bin pairs
+# - res contains N + C_ell_ii for all diagonal spectra
+# - gamm[(i,j)] contains the full gamma_ij(l) array
+# Truncate all gamma_ij(l) arrays to the multipole range [0, cut].
+# 'gamm' is a dictionary whose keys are bin-pair identifiers (e.g. '0,1'),
+# and whose values are C_ell arrays of length (lmax + 1).
+
+new_gamm = {
+    key: (
+        # If the gamma array has the expected length (lmax+1),
+        # we truncate it to (cut+1). Otherwise, keep it unchanged.
+        value[:cut+1] if len(value) == lmax + 1 else value
+    )
+    for key, value in gamm.items()
+}
+######################### BUILD Cl-derivative matrices for each multipole l
+
+# These lists will store, for each multipole l, the gamma matrices and their inverses:
+G = []           # Gamma(l): covariance matrix for all redshift bins at multipole l
+G_inv = []       # Inverse gamma matrix for each l
+
+# These will store the derivative matrices dC_l^{ij} / d(parameter)
+der_H0 = []
+der_ns = []
+der_tau = []
+der_omc = []
+der_fnl = []
+der_A = []
+der_omb = []
+
+####### For each multipole l, create gamma matrices and derivative matrices
+for ell in range(cut + 1):
+
+    # Create Γ_l and Γ_l^{-1}
+    # temp   = Gamma(l)
+    # temp_inv = inverse Gamma(l)
+    temp, temp_inv = create_gamma(ell, new_gamm, z, nD)
+
+    # Create the derivative matrices dC_l^{ij}/dθ for all parameters
+    temp_H0  = create_matrix(ell, ordered_Dcl_H0,  z, nD)
+    temp_ns  = create_matrix(ell, ordered_Dcl_ns,  z, nD)
+    temp_tau = create_matrix(ell, ordered_Dcl_tau, z, nD)
+    temp_omc = create_matrix(ell, ordered_Dcl_omc, z, nD)
+    temp_fnl = create_matrix(ell, ordered_Dcl_fnl, z, nD)
+    temp_A   = create_matrix(ell, ordered_Dcl_A,   z, nD)
+    temp_omb = create_matrix(ell, ordered_Dcl_omb, z, nD)
+
+    # Store everything for this ell
+    G.append(temp)
+    G_inv.append(temp_inv)
+
+    der_H0.append(temp_H0)
+    der_ns.append(temp_ns)
+    der_tau.append(temp_tau)
+    der_omc.append(temp_omc)
+    der_fnl.append(temp_fnl)
+    der_A.append(temp_A)
+    der_omb.append(temp_omb)
+
+# Convert lists into numpy arrays:
+G      = np.array(G, float)
+G_inv  = np.array(G_inv, float)
+der_H0 = np.array(der_H0, float)
+der_ns = np.array(der_ns, float)
+der_tau = np.array(der_tau, float)
+der_omc = np.array(der_omc, float)
+der_fnl = np.array(der_fnl, float)
+der_A   = np.array(der_A, float)
+der_omb = np.array(der_omb, float)
+
+# These arrays have shape: [l, n_bins, n_bins]
+# Example:
+# der_H0[2, 0, 0] gives the derivative matrix element dC_l=2(z0,z0)/dH0
+# Initialize list to store derivatives of C_l with respect to bias
+der_bias = []
+
+# Loop over each redshift bin
+for j in range(len(z)):
+    lis_bias = []  # Store derivative matrices for this redshift bin
+    
+    # Loop over each multipole up to 'cut'
+    for i in range(cut + 1):
+        # Compute derivative matrix dC_l/db_j for multipole i and redshift bin j
+        temp_b = create_matrix(i, ordered_Dcl_bias[j], z, nD)
+        lis_bias.append(temp_b)
+
+    # Append derivative matrices of this redshift bin to der_bias
+    der_bias.append(lis_bias)    
+
+# Convert to numpy array of shape [n_bins, l_max, n_bins, n_bins]
+der_bias = np.array(der_bias, float)
+
+# Initialize arrays to store bias derivatives for cosmological parameters
+H0bias  = np.zeros(len(z), float)
+nsbias  = np.zeros(len(z), float)
+taubias = np.zeros(len(z), float)
+omcbias = np.zeros(len(z), float)
+fnlbias = np.zeros(len(z), float)
+Abias   = np.zeros(len(z), float)
+ombbias = np.zeros(len(z), float)
+
+# Array structure explanation:
+# der_bias[n_bins, l_max, n_bins, n_bins]
+#   - First index: redshift bin (b0 to b9)
+#   - Second index: multipole l
+#   - Last two indices: (z_i × z_j) pairs corresponding to dC_l/db
+# ======================================================================
+# Compute Fisher matrix elements between cosmological parameters and bias
+# ======================================================================
+for i in range(len(z)):
+    H0bias[i]  = Fisher(z, der_H0, der_bias[i], G, cut)
+    nsbias[i]  = Fisher(z, der_ns, der_bias[i], G, cut)
+    taubias[i] = Fisher(z, der_tau, der_bias[i], G, cut)
+    omcbias[i] = Fisher(z, der_omc, der_bias[i], G, cut)
+    fnlbias[i] = Fisher(z, der_fnl, der_bias[i], G, cut)
+    Abias[i]   = Fisher(z, der_A, der_bias[i], G, cut)
+    ombbias[i] = Fisher(z, der_omb, der_bias[i], G, cut)
+
+# ======================================================================
+# Compute Fisher matrix elements between bias parameters (b_i and b_j)
+# ======================================================================
+bias_ij = []
+for i in range(len(z)):
+    for j in range(len(z)):
+        temp = Fisher(z, der_bias[i], der_bias[j], G, cut) 
+        bias_ij.append(temp)
+
+bias_ij = np.array(bias_ij, float).reshape(len(z), len(z))
+
+# ======================================================================
+# Combine Fisher elements between cosmological parameters and bias
+# ======================================================================
+misto = []
+for i in range(len(z)):
+    misto.append([H0bias[i], nsbias[i], taubias[i], omcbias[i], ombbias[i], Abias[i], fnlbias[i]])
+
+misto = np.array(misto, float)
+misto_trasposta = np.transpose(misto)
+
+# ======================================================================
+# Fisher matrix for cosmological parameters only
+# ======================================================================
+H0H0  = Fisher(z, der_H0, der_H0, G, cut)
+H0ns  = Fisher(z, der_H0, der_ns, G, cut)
+H0tau = Fisher(z, der_H0, der_tau, G, cut)
+H0omc = Fisher(z, der_H0, der_omc, G, cut)
+H0omb = Fisher(z, der_H0, der_omb, G, cut)
+H0A   = Fisher(z, der_H0, der_A, G, cut)
+H0fnl = Fisher(z, der_H0, der_fnl, G, cut)
+
+omcomc = Fisher(z, der_omc, der_omc, G, cut)
+omcns  = Fisher(z, der_omc, der_ns, G, cut)
+omctau = Fisher(z, der_omc, der_tau, G, cut)
+omcomb = Fisher(z, der_omc, der_omb, G, cut)
+omcA   = Fisher(z, der_omc, der_A, G, cut)
+omcfnl = Fisher(z, der_omc, der_fnl, G, cut)
+
+nsns     = Fisher(z, der_ns, der_ns, G, cut)
+nstau    = Fisher(z, der_ns, der_tau, G, cut)
+nsomb    = Fisher(z, der_ns, der_omb, G, cut)
+nsA      = Fisher(z, der_ns, der_A, G, cut)
+nsfnl    = Fisher(z, der_ns, der_fnl, G, cut)
+
+tautau    = Fisher(z, der_tau, der_tau, G, cut)
+tauomb    = Fisher(z, der_tau, der_omb, G, cut)
+tauA      = Fisher(z, der_tau, der_A, G, cut)
+taufnl    = Fisher(z, der_tau, der_fnl, G, cut)
+
+fnlA      = Fisher(z, der_fnl, der_A, G, cut)
+fnlomb    = Fisher(z, der_fnl, der_omb, G, cut)
+fnlfnl    = Fisher(z, der_fnl, der_fnl, G, cut)
+
+ombA      = Fisher(z, der_omb, der_A, G, cut)
+ombomb    = Fisher(z, der_omb, der_omb, G, cut)
+
+AA        = Fisher(z, der_A, der_A, G, cut)
+
+Fis_mat = np.array([
+    [H0H0, H0ns, H0tau, H0omc, H0omb, H0A, H0fnl],
+    [H0ns, nsns, nstau, omcns, nsomb, nsA, nsfnl],
+    [H0tau, nstau, tautau, omctau, tauomb, tauA, taufnl],
+    [H0omc, omcns, omctau, omcomc, omcomb, omcA, omcfnl],
+    [H0omb, nsomb, tauomb, omcomb, ombomb, ombA, fnlomb],
+    [H0A, nsA, tauA, omcA, ombA, AA, fnlA],
+    [H0fnl, nsfnl, taufnl, omcfnl, fnlomb, fnlA, fnlfnl]
+], float)
+
+inv_Fis = inv(Fis_mat)
+
+# ======================================================================
+# Full Fisher matrix including bias
+# ======================================================================
+Fishe = np.zeros([7 + len(z), 7 + len(z)], float)
+Fishe[0:7, 0:7] = np.copy(Fis_mat)
+Fishe[0:7, 7:]  = np.copy(misto_trasposta)
+Fishe[7:, 0:7]  = np.copy(misto)
+Fishe[7:, 7:]   = np.copy(bias_ij)
+
+inv_Fishe = inv(Fishe)
+
+# ======================================================================
+# Planck prior for cosmological parameters (to add to Fisher with bias)
+# ======================================================================
+prior = np.zeros([7 + len(z), 7 + len(z)], float)
+prior[0,0] = 1. / (0.42**2)        # H0
+prior[1,1] = 1. / (0.0038**2)      # n_s
+prior[2,2] = 1. / (0.0071**2)      # tau
+prior[3,3] = 1. / (0.00091**2)     # omega_cdm
+prior[4,4] = 1. / (0.00014**2)     # omega_b
+prior[5,5] = 1. / (0.030e-9**2)    # A_s
+
+# Prior for run without bias parameters
+prior_nobias = np.zeros([7, 7], float)
+prior_nobias[0,0] = 1. / (0.42**2)       
+prior_nobias[1,1] = 1. / (0.0038**2)     
+prior_nobias[2,2] = 1. / (0.0071**2)     
+prior_nobias[3,3] = 1. / (0.00091**2)    
+prior_nobias[4,4] = 1. / (0.00014**2)    
+prior_nobias[5,5] = 1. / (0.030e-9**2)   
+
+# Fisher + priors
+Fis_mat_w_prior      = Fis_mat + prior_nobias
+Fishe_w_prior        = Fishe + prior
+
+inv_Fis_mat_w_prior  = inv(Fis_mat_w_prior)
+inv_Fishe_w_prior    = inv(Fishe_w_prior)
+
+# ======================================================================
+# Fisher matrix with prior on all parameters including bias bins
+# ======================================================================
+prior_tutto = np.zeros([7 + len(z), 7 + len(z)], float)
+prior_tutto[0,0] = 1. / (0.42**2)       
+prior_tutto[1,1] = 1. / (0.0038**2)     
+prior_tutto[2,2] = 1. / (0.0071**2)     
+prior_tutto[3,3] = 1. / (0.00091**2)    
+prior_tutto[4,4] = 1. / (0.00014**2)    
+prior_tutto[5,5] = 1. / (0.030e-9**2)   
+
+# Priors on bias bins
+bias_bins_prior = bias_bins * 0.5
+for i in range(7, len(prior_tutto)):
+    prior_tutto[i, i] = 1. / (bias_bins_prior[i-7]**2)
+
+Fishe_w_prior_tutto = Fishe + prior_tutto
+inv_Fishe_w_prior_tutto = inv(Fishe_w_prior_tutto)
